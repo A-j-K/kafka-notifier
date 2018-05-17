@@ -1,0 +1,36 @@
+#pragma once
+
+#include <memory>
+#include <librdkafka/rdkafka.h>
+
+#include "curler.hpp"
+#include "config/abstract_config.hpp"
+
+class Kafka
+{
+public:
+	typedef std::shared_ptr<Kafka> ShPtr;
+
+
+protected:
+	rd_kafka_t		*_pKafka;
+	Curler::ShPtr 		_spCurler;
+	AbstractConfig::ShPtr	_spConfig;
+
+	rd_kafka_t* create(rd_kafka_conf_t*);
+
+	rd_kafka_conf_t* configure();
+
+	int _waitEof;
+
+	Kafka(); // Protect standard constructor.
+
+public:
+	Kafka(AbstractConfig::ShPtr &spConfig, Curler::ShPtr &spCurler);
+	virtual ~Kafka();
+
+	virtual void run();
+	virtual int getWaitEof() { return _waitEof; }
+	virtual Kafka& setWaitEof(int val) { _waitEof = val; }
+};
+

@@ -1,0 +1,182 @@
+
+#include <sstream>
+#include <iostream>
+#include <stdexcept>
+#include <exception>
+
+#include "utils.hpp"
+#include "kafka.hpp"
+#include "kafkac.hpp"
+
+
+Kafka::Kafka()
+{} // Protected constructor to prevent use.
+
+Kafka::~Kafka()
+{
+	if(_pKafka) {
+		int run = 5;
+		rd_kafka_destroy(_pKafka);
+		while(run-- && rd_kafka_wait_destroyed(1000) == -1) {
+			std::cout << "Waiting for librdkafka to terminate\n";
+		}
+		if(run <= 0) {
+			rd_kafka_dump(stdout, _pKafka);
+		}
+	}
+
+}
+
+rd_kafka_conf_t *
+Kafka::configure()
+{
+	rd_kafka_conf_t *pconf = NULL;
+	rd_kafka_topic_conf_t *ptopic_conf = rd_kafka_topic_conf_new();
+	if(!ptopic_conf) {
+		return pconf;
+	}
+	if(!(pconf = rd_kafka_conf_new())) {
+		rd_kafka_topic_conf_destroy(ptopic_conf);
+		return pconf;
+	}
+
+	rd_kafka_conf_set_log_cb(pconf, kafka_logger);
+
+	Utils::KeyValue options = _spConfig->getClientOptions();
+	Utils::KeyValue::iterator itor_options;
+	itor_options = options.begin();
+	while(itor_options != options.end()) {
+		size_t topic_pos;
+		char errstr[512];
+		std::string name = itor_options->first;
+		std::string value = itor_options->second;
+		rd_kafka_conf_res_t result = RD_KAFKA_CONF_UNKNOWN;
+		topic_pos = name.find("topic.", 0);
+		if(topic_pos != std::string::npos && topic_pos == 0) {
+			name = name.substr(sizeof("topic.")-1);
+			result = rd_kafka_topic_conf_set(ptopic_conf,
+				name.c_str(), value.c_str(), 
+				errstr, sizeof(errstr));
+		}
+		if(result == RD_KAFKA_CONF_UNKNOWN) {
+			result = rd_kafka_conf_set(pconf,
+				name.c_str(), value.c_str(),
+				errstr, sizeof(errstr));
+			if(result != RD_KAFKA_CONF_OK) {
+				std::stringstream oss;
+				oss << "Failed to set option: " 
+					<< name << " at line " << __LINE__;
+				throw new std::invalid_argument(oss.str());
+			}
+			if(name == "group.id") {
+				result = rd_kafka_topic_conf_set(ptopic_conf,
+					"offset.store.method", "broker",
+					errstr, sizeof(errstr));
+				if(result != RD_KAFKA_CONF_OK) {
+					std::stringstream oss;
+					oss << "Failed to set \"offset.store.method\" at line " 
+						<< __LINE__ << ":  " << errstr;
+					throw new std::invalid_argument(oss.str());
+				}
+			}
+		}
+		if(result != RD_KAFKA_CONF_OK) {
+			std::stringstream oss;
+			oss << "Failed to set option: " 
+				<< name << " at line " << __LINE__;
+			throw new std::invalid_argument(oss.str());
+		}
+		itor_options++;
+	}
+
+	std::string topic = _spConfig->getTopic();
+	if(topic.size() < 1) {
+		throw new std::invalid_argument("No topic set");
+	}
+
+	rd_kafka_conf_set_rebalance_cb(pconf, kafka_rebalance);
+	rd_kafka_topic_conf_set_opaque(ptopic_conf, (void*)this);
+	rd_kafka_conf_set_default_topic_conf(pconf, ptopic_conf);
+	//rd_kafka_topic_conf_destroy(ptopic_conf);
+	
+	return pconf;
+}
+
+rd_kafka_t*
+Kafka::create(rd_kafka_conf_t* pconf)
+{
+	char errstr[512];
+	rd_kafka_t *pkafka = rd_kafka_new(RD_KAFKA_CONSUMER, pconf, errstr, sizeof(errstr));
+	if(!pkafka) {
+		std::stringstream oss;
+		oss << "Failed to create Kafka Object at line " << __LINE__ 
+			<< ": " << errstr;
+		throw new std::invalid_argument(oss.str());
+	}
+	do {
+		std::stringstream ossBrokers;
+		const Utils::StringVector brokers = _spConfig->getBrokers();
+		Utils::StringVector::const_iterator itor_brokers = brokers.begin();
+		while(itor_brokers != brokers.end()) {
+			if(ossBrokers.str().size() > 0) {
+				ossBrokers << ",";
+			}
+			ossBrokers << *itor_brokers;
+			itor_brokers++;
+		}
+		rd_kafka_brokers_add(pkafka, ossBrokers.str().c_str());
+	}
+	while(0);
+	return pkafka;
+}
+
+Kafka::Kafka(
+	AbstractConfig::ShPtr& spConfig, 
+	Curler::ShPtr& spCurler) :
+	_spConfig(spConfig),
+	_spCurler(spCurler),
+	_waitEof(0)
+{
+	rd_kafka_topic_partition_list_t *topics;
+	rd_kafka_conf_t *pconf = configure();
+	_pKafka = create(pconf);
+	rd_kafka_poll_set_consumer(_pKafka);
+	topics = rd_kafka_topic_partition_list_new(1);
+	rd_kafka_topic_partition_list_add(topics, _spConfig->getTopic().c_str(),
+		_spConfig->getPartition());
+	//if(rd_kafka_committed(_pKafka, topics, 5000) != RD_KAFKA_RESP_ERR_NO_ERROR) {
+	//	std::stringstream oss;
+	//	oss << "Failed on committed at line " << __LINE__;
+	//	throw new std::invalid_argument(oss.str());
+	//}
+}
+
+void 
+Kafka::run()
+{
+	bool loop_control = true;
+	while(loop_control) {
+		CurlerRval::ShPtr spRval;
+		rd_kafka_message_t *p = NULL;
+		Utils::StringVector headers;
+		if((p = rd_kafka_consumer_poll(_pKafka, 1000)) != NULL) {
+			if(p->err != RD_KAFKA_RESP_ERR_NO_ERROR) {
+				rd_kafka_message_destroy(p);
+				continue;
+			}
+			std::string key;
+			std::stringstream oss;
+			key.append((char*)p->key, p->key_len);
+			oss << "X-Kafka: " 
+				<< key << ";" 
+				<< rd_kafka_topic_name(p->rkt) << ";"
+				<< p->partition << ";"
+				<< p->offset;
+			headers.push_back(oss.str());
+			spRval = _spCurler->send((char*)p->payload, p->len, headers);
+			rd_kafka_message_destroy(p);
+		}
+	}
+}
+
+
